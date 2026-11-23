@@ -330,3 +330,137 @@ async def run_in_executor(func: Callable[..., T], *args: Any, **kwargs: Any) -> 
     if kwargs:
         return await asyncio.to_thread(functools.partial(func, *args, **kwargs))
     return await asyncio.to_thread(func, *args)
+
+
+def _get_pb_field(obj: Any, attr: str, fallback: Any = "") -> Any:
+    """Safely read a field from either a PocketBase Record or dict."""
+    val = getattr(obj, attr, None)
+    if val is None and isinstance(obj, dict):
+        val = obj.get(attr)
+    elif val is None and hasattr(obj, "get"):
+        val = obj.get(attr)
+    return val if val is not None else fallback
+
+
+def resolve_user_book_id(
+    pb: Any, pb_user_id: str, book_query: str | None
+) -> tuple[str, str]:
+    """
+    Resolve a book ID, title, author, or ISBN to a (record_id, title) tuple
+    owned by `pb_user_id` in `shisho_books`.
+    Returns ("", "") when cleared/empty or no matching book is found.
+    """
+    if not book_query or not str(book_query).strip() or not pb_user_id:
+        return ("", "")
+
+    clean_q = str(book_query).strip()
+    if clean_q.lower() in ("none", "clear", "unlink", "null"):
+        return ("", "")
+
+    # 1. Exact ID lookup
+    try:
+        rec = pb.collection("shisho_books").get_one(clean_q)
+        if rec and _get_pb_field(rec, "owner") == pb_user_id:
+            return (
+                str(_get_pb_field(rec, "id")),
+                str(_get_pb_field(rec, "title") or "Untitled"),
+            )
+    except Exception:
+        pass
+
+    # 2. Search by title, ISBN, or author
+    try:
+        clean_isbn = clean_q.replace("-", "").replace(" ", "").strip()
+        safe_q = clean_q.replace("'", "\\'")
+        safe_isbn = (clean_isbn or clean_q).replace("'", "\\'")
+        filter_str = (
+            f"owner = '{pb_user_id}' && "
+            f"(title ~ '{safe_q}' || isbn ~ '{safe_isbn}' || author ~ '{safe_q}')"
+        )
+        records = pb.collection("shisho_books").get_full_list(
+            query_params={"filter": filter_str}
+        )
+        if not records:
+            return ("", "")
+
+        matched = None
+        for r in records:
+            r_title = str(_get_pb_field(r, "title")).strip().lower()
+            r_isbn = str(_get_pb_field(r, "isbn")).replace("-", "").replace(" ", "").strip()
+            if r_title == clean_q.lower() or (clean_isbn and r_isbn == clean_isbn):
+                matched = r
+                break
+        if not matched:
+            matched = records[0]
+
+        return (
+            str(_get_pb_field(matched, "id")),
+            str(_get_pb_field(matched, "title") or "Untitled"),
+        )
+    except Exception:
+        return ("", "")
+
+
+def get_user_book_titles_map(pb: Any, pb_user_id: str) -> dict[str, str]:
+    """
+    Fetch all `shisho_books` owned by `pb_user_id` and return a {record_id: title} map.
+    """
+    if not pb_user_id:
+        return {}
+    try:
+        records = pb.collection("shisho_books").get_full_list(
+            query_params={"filter": f"owner = '{pb_user_id}'"}
+        )
+        result: dict[str, str] = {}
+        for r in records:
+            rec_id = _get_pb_field(r, "id")
+            if rec_id:
+                result[str(rec_id)] = str(_get_pb_field(r, "title") or "Untitled")
+        return result
+    except Exception:
+        return {}
+
+
+def user_book_autocomplete_choices(
+    discord_user_id: str,
+    current: str,
+    include_unlink: bool = False,
+) -> list[tuple[str, str]]:
+    """
+    Synchronous helper returning up to 25 (display_label, book_id) tuples
+    for Discord slash command book autocompletes.
+    """
+    try:
+        pb = get_pb_client()
+        pb_user_id = get_discord_user_id(pb, discord_user_id)
+        if not pb_user_id:
+            return []
+
+        records = pb.collection("shisho_books").get_full_list(
+            query_params={"filter": f"owner = '{pb_user_id}'", "sort": "-id"}
+        )
+        clean_cur = (current or "").strip().lower()
+        choices: list[tuple[str, str]] = []
+
+        if include_unlink and (
+            not clean_cur or any(k.startswith(clean_cur) for k in ("none", "unlink", "clear"))
+        ):
+            choices.append(("[None / Unlink Book]", "none"))
+
+        for r in records:
+            rec_id = str(_get_pb_field(r, "id"))
+            title = str(_get_pb_field(r, "title") or "Untitled")
+            author = str(_get_pb_field(r, "author"))
+            isbn = str(_get_pb_field(r, "isbn"))
+            display = f"{title} by {author}" if author else title
+            if (
+                clean_cur
+                and clean_cur not in display.lower()
+                and clean_cur not in isbn.lower()
+            ):
+                continue
+            choices.append((display[:100], rec_id or title))
+
+        return choices[:25]
+    except Exception:
+        return []

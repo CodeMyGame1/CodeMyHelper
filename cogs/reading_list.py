@@ -20,6 +20,7 @@ class ReadingList(commands.Cog):
         self.pb_url = os.getenv("POCKETBASE_URL")
         self.pb_user = os.getenv("POCKETBASE_USER")
         self.pb_password = os.getenv("POCKETBASE_PASSWORD")
+        self.google_books_api_key = os.getenv("GOOGLE_BOOKS_API_KEY")
 
     def get_pb_client(self):
         return get_pb_client()
@@ -35,7 +36,10 @@ class ReadingList(commands.Cog):
         end_date="Finished reading date (YYYY-MM-DD)",
         completed="Completion details or notes",
         description="Book synopsis or review",
-        cover_image="Optional cover image for the book"
+        cover_image="Optional cover image for the book",
+        current_page="Current page number (>= 0)",
+        total_pages="Total number of pages (>= 0, auto-filled if omitted)",
+        rating="Rating from 1 to 5 stars"
     )
     @app_commands.choices(status=[
         app_commands.Choice(name="Planned", value="planned"),
@@ -56,6 +60,9 @@ class ReadingList(commands.Cog):
         completed: str | None = None,
         description: str | None = None,
         cover_image: discord.Attachment = None,
+        current_page: int | None = None,
+        total_pages: int | None = None,
+        rating: int | None = None,
     ):
         if not title and not isbn:
             await interaction.response.send_message("You must provide either a title or an ISBN.", ephemeral=True)
@@ -80,8 +87,15 @@ class ReadingList(commands.Cog):
 
         fetched_image_url = ""
         fetched_desc = ""
-        api_key = os.getenv("GOOGLE_BOOKS_API_KEY")
-        if api_key and (not publish_date or not isbn or not cover_data or not (title and author)):
+        fetched_total_pages = 0
+        api_key = self.google_books_api_key or os.getenv("GOOGLE_BOOKS_API_KEY")
+        if (
+            not publish_date
+            or not isbn
+            or not cover_data
+            or total_pages is None
+            or not (title and author)
+        ):
             from utils import google_books
             search_query = isbn if isbn else (f"{title} {author}".strip() if (title and author) else (title or ""))
             if search_query:
@@ -94,6 +108,7 @@ class ReadingList(commands.Cog):
                     publish_date = publish_date or book_data.get("publishedDate", "")
                     isbn = isbn or book_data.get("isbn", "")
                     fetched_image_url = book_data.get("thumbnail", "")
+                    fetched_total_pages = int(book_data.get("pageCount") or 0)
                     desc = book_data.get("description", "")
                     if desc and desc != "No description available.":
                         fetched_desc = desc
@@ -107,6 +122,11 @@ class ReadingList(commands.Cog):
         isbn = isbn or ""
         final_desc = description if description is not None else fetched_desc
         final_completed = completed or ""
+        final_total_pages = max(0, int(total_pages if total_pages is not None else fetched_total_pages))
+        final_current_page = max(0, int(current_page if current_page is not None else 0))
+        if status_val == "read" and final_total_pages > 0 and final_current_page == 0:
+            final_current_page = final_total_pages
+        final_rating = max(0, min(5, int(rating if rating is not None else 0)))
 
         try:
             await self.add_book_to_pocketbase(
@@ -123,9 +143,22 @@ class ReadingList(commands.Cog):
                 cover_filename, 
                 cover_data,
                 completed=final_completed,
+                current_page=final_current_page,
+                total_pages=final_total_pages,
+                rating=final_rating,
             )
+            extras = []
+            if final_total_pages > 0 or final_current_page > 0:
+                if final_total_pages > 0:
+                    pct = round((final_current_page / final_total_pages) * 100)
+                    extras.append(f"Progress: {final_current_page}/{final_total_pages} pages ({pct}%)")
+                else:
+                    extras.append(f"Page {final_current_page}")
+            if final_rating > 0:
+                extras.append(f"Rating: {'⭐' * final_rating} ({final_rating}/5)")
+            extra_str = f" [{' | '.join(extras)}]" if extras else ""
             await interaction.followup.send(
-                f"Successfully added **{title}** by {author} to the reading list!"
+                f"Successfully added **{title}** by {author} to the reading list!{extra_str}"
             )
         except Exception as e:
             sentry_sdk.capture_exception(e)
@@ -146,6 +179,9 @@ class ReadingList(commands.Cog):
         cover_filename: str | None = None,
         cover_data: bytes | None = None,
         completed: str = "",
+        current_page: int = 0,
+        total_pages: int = 0,
+        rating: int = 0,
         **kwargs,
     ):
         isbn = isbn.replace("-", "").replace(" ", "").strip() if isbn else ""
@@ -155,6 +191,18 @@ class ReadingList(commands.Cog):
         publish_date = kwargs.get("publishDate", publish_date)
         completed = kwargs.get("completed", completed)
         description = kwargs.get("description", description)
+        image_url = kwargs.get("imageUrl", kwargs.get("image_url", image_url)) or ""
+
+        raw_curr = kwargs.get("currentPage", kwargs.get("current_page", current_page))
+        raw_total = kwargs.get("totalPages", kwargs.get("total_pages", total_pages))
+        raw_rating = kwargs.get("rating", rating)
+
+        safe_curr = max(0, int(raw_curr or 0))
+        safe_total = max(0, int(raw_total or 0))
+        safe_rating = max(0, min(5, int(raw_rating or 0)))
+
+        if status_val == "read" and safe_total > 0 and safe_curr == 0:
+            safe_curr = safe_total
 
         def _add():
             pb = self.get_pb_client()
@@ -173,6 +221,10 @@ class ReadingList(commands.Cog):
                 "endDate": final_end_date,
                 "completed": str(completed) if completed is not None else "",
                 "description": description,
+                "imageUrl": image_url,
+                "currentPage": safe_curr,
+                "totalPages": safe_total,
+                "rating": safe_rating,
             }
             
             files = {"cover": (cover_filename, cover_data)} if cover_filename and cover_data else None
@@ -213,6 +265,10 @@ class ReadingList(commands.Cog):
                         "completed": _g(r, "completed"),
                         "cover": _g(r, "cover"),
                         "description": _g(r, "description"),
+                        "imageUrl": _g(r, "imageUrl", _g(r, "image_url")),
+                        "currentPage": int(_g(r, "currentPage", _g(r, "current_page", 0)) or 0),
+                        "totalPages": int(_g(r, "totalPages", _g(r, "total_pages", 0)) or 0),
+                        "rating": int(_g(r, "rating", 0) or 0),
                     })
                 return result
             except Exception as e:
@@ -314,6 +370,36 @@ class ReadingList(commands.Cog):
             if "isbn" in update_data and update_data["isbn"] is not None:
                 payload["isbn"] = str(update_data["isbn"]).replace("-", "").replace(" ", "").strip()
 
+            if "imageUrl" in update_data and update_data["imageUrl"] is not None:
+                payload["imageUrl"] = str(update_data["imageUrl"]).strip()
+            elif "image_url" in update_data and update_data["image_url"] is not None:
+                payload["imageUrl"] = str(update_data["image_url"]).strip()
+
+            if "currentPage" in update_data and update_data["currentPage"] is not None:
+                payload["currentPage"] = max(0, int(update_data["currentPage"]))
+            elif "current_page" in update_data and update_data["current_page"] is not None:
+                payload["currentPage"] = max(0, int(update_data["current_page"]))
+
+            if "totalPages" in update_data and update_data["totalPages"] is not None:
+                payload["totalPages"] = max(0, int(update_data["totalPages"]))
+            elif "total_pages" in update_data and update_data["total_pages"] is not None:
+                payload["totalPages"] = max(0, int(update_data["total_pages"]))
+
+            if "rating" in update_data and update_data["rating"] is not None:
+                payload["rating"] = max(0, min(5, int(update_data["rating"])))
+
+            # Auto-fill start/end dates and currentPage on status transitions
+            new_status = payload.get("status")
+            if new_status == "reading" and "startDate" not in payload and not _g(matched, "startDate", _g(matched, "start_date")):
+                payload["startDate"] = datetime.now().strftime("%Y-%m-%d")
+            elif new_status == "read":
+                if "endDate" not in payload and not _g(matched, "endDate", _g(matched, "end_date")):
+                    payload["endDate"] = datetime.now().strftime("%Y-%m-%d")
+                eff_total = payload.get("totalPages", int(_g(matched, "totalPages", _g(matched, "total_pages", 0)) or 0))
+                eff_curr = payload.get("currentPage", int(_g(matched, "currentPage", _g(matched, "current_page", 0)) or 0))
+                if eff_total > 0 and eff_curr == 0 and "currentPage" not in payload:
+                    payload["currentPage"] = eff_total
+
             # Handle cover
             files = None
             if cover_file and isinstance(cover_file, tuple) and len(cover_file) == 2:
@@ -347,6 +433,10 @@ class ReadingList(commands.Cog):
                 "completed": _g(updated_rec, "completed", payload.get("completed", _g(matched, "completed"))),
                 "cover": _g(updated_rec, "cover", _g(matched, "cover")),
                 "description": _g(updated_rec, "description", payload.get("description", _g(matched, "description"))),
+                "imageUrl": _g(updated_rec, "imageUrl", _g(updated_rec, "image_url", payload.get("imageUrl", _g(matched, "imageUrl")))),
+                "currentPage": int(_g(updated_rec, "currentPage", _g(updated_rec, "current_page", payload.get("currentPage", _g(matched, "currentPage", 0)))) or 0),
+                "totalPages": int(_g(updated_rec, "totalPages", _g(updated_rec, "total_pages", payload.get("totalPages", _g(matched, "totalPages", 0)))) or 0),
+                "rating": int(_g(updated_rec, "rating", payload.get("rating", _g(matched, "rating", 0))) or 0),
             }
 
         return await run_in_executor(_update)
@@ -439,7 +529,10 @@ class ReadingList(commands.Cog):
         description="Book synopsis or notes",
         publish_date="Publish date or year",
         isbn="ISBN of the book",
-        cover_image="Optional cover image to upload"
+        cover_image="Optional cover image to upload",
+        current_page="Current page number (>= 0)",
+        total_pages="Total number of pages (>= 0)",
+        rating="Rating from 1 to 5 stars (0 to clear)"
     )
     @app_commands.choices(status=[
         app_commands.Choice(name="Planned", value="planned"),
@@ -459,6 +552,9 @@ class ReadingList(commands.Cog):
         publish_date: str | None = None,
         isbn: str | None = None,
         cover_image: discord.Attachment | None = None,
+        current_page: int | None = None,
+        total_pages: int | None = None,
+        rating: int | None = None,
     ):
         await interaction.response.defer(ephemeral=True)
 
@@ -477,6 +573,12 @@ class ReadingList(commands.Cog):
             update_data["publishDate"] = publish_date
         if isbn is not None:
             update_data["isbn"] = isbn
+        if current_page is not None:
+            update_data["currentPage"] = current_page
+        if total_pages is not None:
+            update_data["totalPages"] = total_pages
+        if rating is not None:
+            update_data["rating"] = rating
 
         cover_file = None
         if cover_image:
@@ -496,7 +598,18 @@ class ReadingList(commands.Cog):
                 cover_file=cover_file,
             )
             title = updated_record.get("title", "book")
-            await interaction.followup.send(f"Successfully updated **{title}**!")
+            details = [f"Status: {updated_record.get('status', 'unknown')}"]
+            eff_curr = updated_record.get("currentPage", 0)
+            eff_total = updated_record.get("totalPages", 0)
+            if eff_total > 0:
+                pct = round((eff_curr / eff_total) * 100)
+                details.append(f"Progress: {eff_curr}/{eff_total} pages ({pct}%)")
+            elif eff_curr > 0:
+                details.append(f"Page: {eff_curr}")
+            eff_rating = updated_record.get("rating", 0)
+            if eff_rating > 0:
+                details.append(f"Rating: {'⭐' * eff_rating} ({eff_rating}/5)")
+            await interaction.followup.send(f"Successfully updated **{title}**! ({' | '.join(details)})")
         except Exception as e:
             sentry_sdk.capture_exception(e)
             await interaction.followup.send(f"Failed to update book: {e}")

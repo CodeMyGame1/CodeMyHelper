@@ -17,8 +17,11 @@ from utils.db import (
     get_pb_client,
     get_pb_url,
     get_discord_user_id,
+    get_user_book_titles_map,
     prepare_file_upload_payload,
+    resolve_user_book_id,
     run_in_executor,
+    user_book_autocomplete_choices,
 )
 from utils.discord_helpers import UNLINKED_ACCOUNT_MESSAGE
 from utils.gemini_files import stage_or_inline_part
@@ -154,7 +157,7 @@ class Notes(commands.Cog):
         self.pb_user = os.getenv("POCKETBASE_USER")
         self.pb_password = os.getenv("POCKETBASE_PASSWORD")
 
-    async def add_note(self, user_id: str, text: str = "", title: str = "", attachments: list = None, archived: bool = False, editor: str = "") -> str:
+    async def add_note(self, user_id: str, text: str = "", title: str = "", attachments: list = None, archived: bool = False, editor: str = "", book: str | None = None) -> str:
         try:
             if not text and not editor and attachments and len(attachments) > 0:
                 attachment_filename, attachment_bytes = attachments[0]
@@ -226,11 +229,21 @@ class Notes(commands.Cog):
                     "editor": editor,
                     "archived": archived,
                 }
+                linked_book_title = ""
+                if book and str(book).strip():
+                    book_id, book_title = resolve_user_book_id(pb, pb_user_id, book)
+                    if book_id:
+                        entry["book"] = book_id
+                        linked_book_title = book_title
                 
                 files = {"attachment": attachments} if attachments else None
                 final_entry = prepare_file_upload_payload(entry, files)
                     
                 pb.collection("notes").create(final_entry)
+                if linked_book_title:
+                    return f"Note saved successfully! [Linked to book: **{linked_book_title}**]"
+                if book and str(book).strip():
+                    return f"Note saved successfully! *(Note: could not find book '{book}' on your reading list to link)*"
                 return "Note saved successfully!"
 
             res = await run_in_executor(_add_to_pb)
@@ -239,7 +252,7 @@ class Notes(commands.Cog):
             sentry_sdk.capture_exception(e)
             return "Failed to save note. An internal error occurred."
 
-    async def get_notes(self, user_id: str, limit: int = 10, query: str = None, archived: bool | None = False):
+    async def get_notes(self, user_id: str, limit: int = 10, query: str = None, archived: bool | None = False, book: str | None = None):
         try:
             def _get_from_pb():
                 pb = get_pb_client()
@@ -247,11 +260,18 @@ class Notes(commands.Cog):
                 if not pb_user_id:
                     return f"Error: {UNLINKED_ACCOUNT_MESSAGE}"
                 
+                books_map = get_user_book_titles_map(pb, pb_user_id)
                 base_filter_parts = [f"owner = '{pb_user_id}'"]
                 if archived is True:
                     base_filter_parts.append("archived = true")
                 elif archived is False:
                     base_filter_parts.append("(archived = false || archived = null)")
+
+                if book and str(book).strip():
+                    filter_book_id, _ = resolve_user_book_id(pb, pb_user_id, book)
+                    if not filter_book_id:
+                        return []
+                    base_filter_parts.append(f"book = '{filter_book_id}'")
 
                 records = []
                 # 1. Try exact query filter in PocketBase if query is provided
@@ -285,6 +305,7 @@ class Notes(commands.Cog):
                         text = getattr(record, "text", "") or (record.get("text", "") if hasattr(record, "get") else "")
                         editor = getattr(record, "editor", "") or (record.get("editor", "") if hasattr(record, "get") else "")
                         is_archived = bool(getattr(record, "archived", False) or (record.get("archived", False) if hasattr(record, "get") else False))
+                        book_id = getattr(record, "book", "") or (record.get("book", "") if hasattr(record, "get") else "") or ""
 
                         if archived is not None and is_archived != archived:
                             continue
@@ -309,6 +330,8 @@ class Notes(commands.Cog):
                             "text": text,
                             "editor": editor,
                             "archived": is_archived,
+                            "book": book_id,
+                            "book_title": books_map.get(book_id, "") if book_id else "",
                             "created": created_val,
                             "updated": updated_val,
                             "attachment_filenames": [],
@@ -411,6 +434,7 @@ class Notes(commands.Cog):
         editor: str | None = None,
         archived: bool | None = None,
         attachments: list = None,
+        book: str | None = None,
     ) -> str:
         try:
             def _update_in_pb():
@@ -436,6 +460,15 @@ class Notes(commands.Cog):
                     update_data["editor"] = editor
                 if archived is not None:
                     update_data["archived"] = archived
+                if book is not None:
+                    clean_book = str(book).strip()
+                    if clean_book.lower() in ("none", "clear", "unlink", "null", ""):
+                        update_data["book"] = ""
+                    else:
+                        book_id, _ = resolve_user_book_id(pb, pb_user_id, clean_book)
+                        if not book_id:
+                            return f"Error: Could not find a book matching '{clean_book}' on your reading list."
+                        update_data["book"] = book_id
 
                 if not update_data and not attachments:
                     return "Error: No update fields provided."
@@ -529,18 +562,30 @@ class Notes(commands.Cog):
         except Exception:
             return []
 
+    async def book_link_autocomplete(
+        self, interaction: discord.Interaction, current: str, include_unlink: bool = False
+    ) -> list[app_commands.Choice[str]]:
+        pairs = await run_in_executor(
+            user_book_autocomplete_choices,
+            str(interaction.user.id),
+            current,
+            include_unlink,
+        )
+        return [app_commands.Choice(name=label, value=val) for label, val in pairs]
+
     @app_commands.command(name="note", description="Add a personal note.")
     @app_commands.describe(
         text="The content of your note",
         title="Optional title for the note",
         archived="Whether to save the note directly as archived",
+        book="Optional book from your reading list to link this note to",
         attachment="Optional file attachment",
         attachment2="Optional second file attachment",
         attachment3="Optional third file attachment",
         attachment4="Optional fourth file attachment",
         attachment5="Optional fifth file attachment"
     )
-    async def slash_note(self, interaction: discord.Interaction, text: str = "", title: str = "", archived: bool = False, attachment: discord.Attachment = None, attachment2: discord.Attachment = None, attachment3: discord.Attachment = None, attachment4: discord.Attachment = None, attachment5: discord.Attachment = None):
+    async def slash_note(self, interaction: discord.Interaction, text: str = "", title: str = "", archived: bool = False, book: str = None, attachment: discord.Attachment = None, attachment2: discord.Attachment = None, attachment3: discord.Attachment = None, attachment4: discord.Attachment = None, attachment5: discord.Attachment = None):
         await interaction.response.defer(ephemeral=True)
         
         atts = []
@@ -552,20 +597,27 @@ class Notes(commands.Cog):
             await interaction.followup.send("You must provide either text or an attachment.")
             return
 
-        response = await self.add_note(str(interaction.user.id), text=text, title=title, attachments=atts, archived=archived)
+        response = await self.add_note(str(interaction.user.id), text=text, title=title, attachments=atts, archived=archived, book=book)
         await interaction.followup.send(response)
+
+    @slash_note.autocomplete("book")
+    async def slash_note_book_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        return await self.book_link_autocomplete(interaction, current)
 
     @app_commands.command(name="notes", description="List your recent notes, or view a specific note by name.")
     @app_commands.describe(
         name="Optional name or keyword of a specific note to view fully",
-        filter="Filter notes by status (active, archived, or all)"
+        filter="Filter notes by status (active, archived, or all)",
+        book="Optional book from your reading list to filter notes by"
     )
     @app_commands.choices(filter=[
         app_commands.Choice(name="Active (Unarchived)", value="active"),
         app_commands.Choice(name="Archived", value="archived"),
         app_commands.Choice(name="All", value="all"),
     ])
-    async def slash_notes(self, interaction: discord.Interaction, name: str = None, filter: app_commands.Choice[str] = None):
+    async def slash_notes(self, interaction: discord.Interaction, name: str = None, filter: app_commands.Choice[str] = None, book: str = None):
         await interaction.response.defer(ephemeral=True)
         archived_filter = False
         if filter:
@@ -576,7 +628,7 @@ class Notes(commands.Cog):
             elif filter.value == "all":
                 archived_filter = None
 
-        notes = await self.get_notes(str(interaction.user.id), limit=10, query=name, archived=archived_filter)
+        notes = await self.get_notes(str(interaction.user.id), limit=10, query=name, archived=archived_filter, book=book)
         
         if isinstance(notes, str):
             await interaction.followup.send(f"An error occurred fetching notes: {notes}")
@@ -596,6 +648,8 @@ class Notes(commands.Cog):
                 title += " *(Archived)*"
             
             msg = f"**{title}**\n"
+            if note.get("book_title"):
+                msg += f"📚 *Book: {note['book_title']}*\n"
             if display_body:
                 msg += f"{display_body}\n"
 
@@ -633,10 +687,17 @@ class Notes(commands.Cog):
                         title = "Untitled Note"
                 if note.get("archived") and archived_filter is None:
                     title += " *(Archived)*"
+                book_tag = f" *(📚 {note['book_title']})*" if note.get("book_title") else ""
                 
-                msg += f"{idx}. **{title}**\n"
+                msg += f"{idx}. **{title}**{book_tag}\n"
             
             await interaction.followup.send(content=msg, suppress_embeds=True)
+
+    @slash_notes.autocomplete("book")
+    async def slash_notes_book_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        return await self.book_link_autocomplete(interaction, current)
 
     @app_commands.command(name="archivenote", description="Archive a personal note.")
     @app_commands.describe(note="The note to archive (select from list or type title/ID)")

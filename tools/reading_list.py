@@ -50,6 +50,18 @@ ADD_BOOK_TOOL = types.FunctionDeclaration(
                 type=types.Type.STRING,
                 description="Synopsis, summary, or review notes (optional)",
             ),
+            "current_page": types.Schema(
+                type=types.Type.INTEGER,
+                description="Current page number the user is on (>= 0).",
+            ),
+            "total_pages": types.Schema(
+                type=types.Type.INTEGER,
+                description="Total number of pages in the book (>= 0). Auto-filled from book metadata if omitted when adding.",
+            ),
+            "rating": types.Schema(
+                type=types.Type.INTEGER,
+                description="User rating for the book from 1 to 5 stars (0 to clear).",
+            ),
         },
         required=["title"],
     ),
@@ -57,7 +69,7 @@ ADD_BOOK_TOOL = types.FunctionDeclaration(
 
 GET_READING_LIST_TOOL = types.FunctionDeclaration(
     name="get_reading_list",
-    description="Retrieves the user's reading list from PocketBase, including book titles, authors, statuses, dates, completion info, and descriptions. Call this ONLY when the user explicitly asks about their reading list or asks for book recommendations.",
+    description="Retrieves the user's reading list from PocketBase, including book titles, authors, statuses, page progress, ratings, dates, completion info, and descriptions. Call this ONLY when the user explicitly asks about their reading list or asks for book recommendations.",
     parameters=types.Schema(
         type=types.Type.OBJECT,
         properties={
@@ -71,7 +83,7 @@ GET_READING_LIST_TOOL = types.FunctionDeclaration(
 
 UPDATE_BOOK_TOOL = types.FunctionDeclaration(
     name="update_book",
-    description="Updates an existing book on the user's reading list on PocketBase by title, author, ISBN, or ID (e.g. status, reading dates, completion progress, description, ISBN).",
+    description="Updates an existing book on the user's reading list on PocketBase by title, author, ISBN, or ID (e.g. status, page progress, total pages, rating, reading dates, completion progress, description, ISBN).",
     parameters=types.Schema(
         type=types.Type.OBJECT,
         properties={
@@ -116,6 +128,18 @@ UPDATE_BOOK_TOOL = types.FunctionDeclaration(
                 type=types.Type.STRING,
                 description="ISBN of the book (optional)",
             ),
+            "current_page": types.Schema(
+                type=types.Type.INTEGER,
+                description="Current page number the user is on (>= 0).",
+            ),
+            "total_pages": types.Schema(
+                type=types.Type.INTEGER,
+                description="Total number of pages in the book (>= 0).",
+            ),
+            "rating": types.Schema(
+                type=types.Type.INTEGER,
+                description="User rating for the book from 1 to 5 stars (0 to clear).",
+            ),
         },
         required=["query"],
     ),
@@ -157,52 +181,62 @@ async def handle_add_book(bot, args: dict, user_id: str = None, context: dict | 
     end_date = str(args.get("end_date", args.get("endDate", ""))).strip() if args else ""
     completed = str(args.get("completed", "")).strip() if args else ""
     description = str(args.get("description", "")).strip() if args else ""
+    raw_curr = args.get("current_page", args.get("currentPage")) if args else None
+    raw_total = args.get("total_pages", args.get("totalPages")) if args else None
+    raw_rating = args.get("rating") if args else None
 
     if not title and not isbn:
         return "Error: Title or ISBN is required."
 
-    api_key = os.getenv("GOOGLE_BOOKS_API_KEY")
+    api_key = getattr(reading_list_cog, "google_books_api_key", None) or os.getenv("GOOGLE_BOOKS_API_KEY")
     image_url = ""
     cover_filename = None
     cover_data = None
+    fetched_total_pages = 0
 
-    # Automatically fetch book data from Google Books API to populate missing details and cover
-    if api_key:
-        from utils import google_books
+    # Automatically fetch book data (Google Books with Open Library fallback)
+    from utils import google_books
 
-        search_query = (
-            isbn
-            if isbn
-            else (
-                f"{title} {author}".strip()
-                if (title and author)
-                else (title or "")
-            )
+    search_query = (
+        isbn
+        if isbn
+        else (
+            f"{title} {author}".strip()
+            if (title and author)
+            else (title or "")
         )
-        if search_query:
-            book_data = await google_books.fetch_book_data(search_query, api_key)
-            if isinstance(book_data, dict):
-                title = title or book_data.get("title", "")
-                authors = book_data.get("authors", [])
-                if not author and authors and authors != ["Unknown Author"]:
-                    author = ", ".join(authors)
-                if (
-                    not publish_date
-                    and book_data.get("publishedDate")
-                    and book_data.get("publishedDate") != "Unknown"
-                ):
-                    publish_date = book_data.get("publishedDate")
-                if not isbn and book_data.get("isbn"):
-                    isbn = book_data.get("isbn")
-                image_url = book_data.get("thumbnail", "")
-                desc = book_data.get("description", "")
-                if not description and desc and desc != "No description available.":
-                    description = desc
+    )
+    if search_query:
+        book_data = await google_books.fetch_book_data(search_query, api_key)
+        if isinstance(book_data, dict):
+            title = title or book_data.get("title", "")
+            authors = book_data.get("authors", [])
+            if not author and authors and authors != ["Unknown Author"]:
+                author = ", ".join(authors)
+            if (
+                not publish_date
+                and book_data.get("publishedDate")
+                and book_data.get("publishedDate") != "Unknown"
+            ):
+                publish_date = book_data.get("publishedDate")
+            if not isbn and book_data.get("isbn"):
+                isbn = book_data.get("isbn")
+            image_url = book_data.get("thumbnail", "")
+            fetched_total_pages = int(book_data.get("pageCount") or 0)
+            desc = book_data.get("description", "")
+            if not description and desc and desc != "No description available.":
+                description = desc
 
-                if image_url:
-                    cover_filename, cover_data = await google_books.download_image(
-                        image_url
-                    )
+            if image_url:
+                cover_filename, cover_data = await google_books.download_image(
+                    image_url
+                )
+
+    final_total_pages = max(0, int(raw_total if raw_total is not None else fetched_total_pages))
+    final_current_page = max(0, int(raw_curr if raw_curr is not None else 0))
+    if status == "read" and final_total_pages > 0 and final_current_page == 0:
+        final_current_page = final_total_pages
+    final_rating = max(0, min(5, int(raw_rating if raw_rating is not None else 0)))
 
     today = datetime.now().strftime("%Y-%m-%d")
     final_start = start_date if start_date else (today if status in ["read", "reading"] else "")
@@ -226,8 +260,21 @@ async def handle_add_book(bot, args: dict, user_id: str = None, context: dict | 
         cover_filename=cover_filename,
         cover_data=cover_data,
         completed=completed,
+        current_page=final_current_page,
+        total_pages=final_total_pages,
+        rating=final_rating,
     )
-    return f"Successfully added '{title or 'Unknown Title'}' by {author or 'Unknown Author'} (status: {status}) to the reading list."
+    details = []
+    if final_total_pages > 0 or final_current_page > 0:
+        if final_total_pages > 0:
+            pct = round((final_current_page / final_total_pages) * 100)
+            details.append(f"progress: {final_current_page}/{final_total_pages} pages ({pct}%)")
+        else:
+            details.append(f"page: {final_current_page}")
+    if final_rating > 0:
+        details.append(f"rating: {final_rating}/5")
+    detail_str = f", {', '.join(details)}" if details else ""
+    return f"Successfully added '{title or 'Unknown Title'}' by {author or 'Unknown Author'} (status: {status}{detail_str}) to the reading list."
 
 
 async def handle_get_reading_list(bot, args: dict, user_id: str = None, context: dict | None = None, **kwargs) -> str:
@@ -241,25 +288,48 @@ async def handle_get_reading_list(bot, args: dict, user_id: str = None, context:
     if not reading_list_cog:
         return "Error: ReadingList cog is unavailable."
     status_filter = str(args.get("status", "")).strip().lower() if args else ""
-    books = await reading_list_cog.fetch_reading_list(user_id)
-    if not books:
+    all_books = await reading_list_cog.fetch_reading_list(user_id)
+    if not all_books:
         return "No books found in reading list."
+
+    # Compute reading stats summary across the library
+    reading_count = sum(1 for b in all_books if b.get("status", "").lower() == "reading")
+    read_count = sum(1 for b in all_books if b.get("status", "").lower() == "read")
+    total_pages_read = sum(
+        (b.get("totalPages") or 0)
+        if b.get("status", "").lower() == "read" and (b.get("totalPages") or 0) > 0
+        else (b.get("currentPage") or 0)
+        for b in all_books
+    )
+    stats_header = f"Stats: {reading_count} reading, {read_count} read, {total_pages_read} total pages read"
+
+    books = all_books
     if status_filter and status_filter != "all":
         filtered_books = [
-            b for b in books if b.get("status", "").lower() == status_filter
+            b for b in all_books if b.get("status", "").lower() == status_filter
         ]
         if filtered_books:
             books = filtered_books
         else:
             return f"No books found with status '{status_filter}' in reading list."
 
-    formatted = []
+    formatted = [stats_header]
     for b in books:
         title = b.get("title", "Unknown")
         author = b.get("author", "Unknown")
         status = b.get("status", "unknown")
         line = f"- **{title}** by {author} (Status: {status})"
         extras = []
+        curr_p = int(b.get("currentPage") or 0)
+        total_p = int(b.get("totalPages") or 0)
+        rating = int(b.get("rating") or 0)
+        if total_p > 0:
+            pct = round((curr_p / total_p) * 100)
+            extras.append(f"Progress: {curr_p}/{total_p} pages ({pct}%)")
+        elif curr_p > 0:
+            extras.append(f"Page: {curr_p}")
+        if rating > 0:
+            extras.append(f"Rating: {rating}/5 ★")
         if b.get("isbn"):
             extras.append(f"ISBN: {b['isbn']}")
         if b.get("publishDate"):
@@ -321,6 +391,16 @@ async def handle_update_book(bot, args: dict, user_id: str = None, context: dict
         update_data["description"] = args["description"]
     if "isbn" in args and args["isbn"] is not None:
         update_data["isbn"] = args["isbn"]
+    if "current_page" in args and args["current_page"] is not None:
+        update_data["currentPage"] = args["current_page"]
+    elif "currentPage" in args and args["currentPage"] is not None:
+        update_data["currentPage"] = args["currentPage"]
+    if "total_pages" in args and args["total_pages"] is not None:
+        update_data["totalPages"] = args["total_pages"]
+    elif "totalPages" in args and args["totalPages"] is not None:
+        update_data["totalPages"] = args["totalPages"]
+    if "rating" in args and args["rating"] is not None:
+        update_data["rating"] = args["rating"]
 
     if not update_data:
         return "Error: No update parameters provided."
@@ -333,7 +413,18 @@ async def handle_update_book(bot, args: dict, user_id: str = None, context: dict
         )
         title = updated_rec.get("title", query)
         status = updated_rec.get("status", "unknown")
-        return f"Successfully updated '{title}' (Status: {status})."
+        details = [f"Status: {status}"]
+        curr_p = int(updated_rec.get("currentPage") or 0)
+        total_p = int(updated_rec.get("totalPages") or 0)
+        rating = int(updated_rec.get("rating") or 0)
+        if total_p > 0:
+            pct = round((curr_p / total_p) * 100)
+            details.append(f"Progress: {curr_p}/{total_p} pages ({pct}%)")
+        elif curr_p > 0:
+            details.append(f"Page: {curr_p}")
+        if rating > 0:
+            details.append(f"Rating: {rating}/5")
+        return f"Successfully updated '{title}' ({', '.join(details)})."
     except Exception as e:
         return f"Error updating book: {e}"
 

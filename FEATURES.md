@@ -103,4 +103,21 @@
   - **Fix Match & Agent Association:** Search Plex metadata agents (`GET /library/metadata/{id}/matches` across Plex Music, MusicBrainz, Last.fm, TMDb, IMDb, TheTVDB, etc.), inspect candidate matches with confidence scores and GUIDs, apply specific or automatic agent matches (`PUT /library/metadata/{id}/match`), or unmatch items (`PUT /library/metadata/{id}/unmatch`). Prioritized first by Shisho when correcting or fixing misidentified media so official GUIDs, tracklists, release dates, genres, and cover art are retrieved before falling back to manual field overrides.
   - **Community Recommendations & Library Matching:** Collect music suggestions via Discord or web form with automatic YouTube Music / Qobuz links, and automatically cross-reference against your Plex library to indicate whether a suggestion is already owned.
 
+## Reading List Progress, Ratings & Open Library Fallback
+- **Commands:** `/addbook`, `/editbook`, `/bookinfo`, `/force_sync`
+- **AI Tools:** `add_book`, `get_reading_list`, `update_book`
+- **Features:**
+  - **Progress Tracking & Star Ratings:** Tracks `currentPage`, `totalPages`, `rating` (0–5 stars clamped), and `imageUrl` on `shisho_books` records.
+  - **Automatic Transitions:** Automatically sets `totalPages` from book metadata when adding or syncing books, sets `startDate` when transitioning to `reading`, and sets `endDate` + `currentPage = totalPages` when marked `read`.
+  - **Reading Stats Summary:** `get_reading_list` reports aggregate counts (`reading`, `read`, `total pages read`) plus per-book percentage progress and ratings.
+  - **Zero-Config Open Library Fallback:** `utils/google_books.py` (`fetch_open_library_data`) automatically falls back to Open Library Search (`https://openlibrary.org/search.json`) when `GOOGLE_BOOKS_API_KEY` is absent or Google Books returns no match.
+
+## Cross-Feature Book Linking (Notes & Reminders)
+- **Commands:** `/note`, `/notes`, `/remind`, `/reminders`, `/editreminder`
+- **AI Tools:** `add_note`, `get_notes`, `update_note`, `set_reminder`, `batch_set_reminders`, `list_reminders`, `update_reminder`
+- **Features:**
+  - **Relation Resolution:** Notes and reminders accept an optional `book` parameter (ID, title, author, or ISBN) resolved to the user's `shisho_books` record ID (`resolve_user_book_id`), with Discord slash command autocomplete.
+  - **Filtering & Unlinking:** Filter `/notes`, `/reminders`, `get_notes`, and `list_reminders` by linked book, display linked book titles (`📚`), and pass `"none"` / `"unlink"` when updating to clear a link.
+
+
 

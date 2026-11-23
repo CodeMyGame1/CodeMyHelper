@@ -27,6 +27,10 @@ ADD_NOTE_TOOL = types.FunctionDeclaration(
                 type=types.Type.BOOLEAN,
                 description="Optional flag whether to create this note as archived (defaults to false)",
             ),
+            "book": types.Schema(
+                type=types.Type.STRING,
+                description="Optional title, ISBN, or ID of a book on the user's reading list to link this note to",
+            ),
         },
     ),
 )
@@ -44,6 +48,10 @@ GET_NOTES_TOOL = types.FunctionDeclaration(
             "archived": types.Schema(
                 type=types.Type.BOOLEAN,
                 description="Optional filter: set to true for archived notes only, false for active/unarchived notes only (default is false).",
+            ),
+            "book": types.Schema(
+                type=types.Type.STRING,
+                description="Optional book title, ISBN, or ID to filter notes linked to a specific book.",
             ),
         },
     ),
@@ -129,6 +137,10 @@ UPDATE_NOTE_TOOL = types.FunctionDeclaration(
                 type=types.Type.BOOLEAN,
                 description="Set archived status to true or false (optional)",
             ),
+            "book": types.Schema(
+                type=types.Type.STRING,
+                description="Optional book title, ISBN, or ID from the user's reading list to link this note to (pass 'none' to unlink).",
+            ),
         },
         required=["query"],
     ),
@@ -166,6 +178,7 @@ async def handle_add_note(bot, args: dict, user_id: str, context: dict | None = 
         archived = raw_archived.strip().lower() in ("true", "1", "yes")
     else:
         archived = bool(raw_archived) if raw_archived is not None else False
+    book = str(args.get("book") or "").strip() or None
 
     attachments = extract_attachments_from_context(context)
     if not text and not title and not editor and not attachments:
@@ -177,6 +190,7 @@ async def handle_add_note(bot, args: dict, user_id: str, context: dict | None = 
         editor=editor,
         attachments=attachments or None,
         archived=archived,
+        book=book,
     )
     return res
 
@@ -187,6 +201,7 @@ async def handle_get_notes(bot, args: dict, user_id: str) -> str:
     if not notes_cog:
         return "Error: Notes cog is unavailable."
     query = str(args.get("query") or args.get("search") or "").strip()
+    book = str(args.get("book") or "").strip() or None
     archived_arg = args.get("archived")
     if archived_arg is None:
         archived = False
@@ -197,7 +212,7 @@ async def handle_get_notes(bot, args: dict, user_id: str) -> str:
     else:
         archived = bool(archived_arg)
 
-    notes = await notes_cog.get_notes(user_id, limit=10, query=query or None, archived=archived)
+    notes = await notes_cog.get_notes(user_id, limit=10, query=query or None, archived=archived, book=book)
     if isinstance(notes, str):
         return notes
     if not notes:
@@ -209,10 +224,11 @@ async def handle_get_notes(bot, args: dict, user_id: str) -> str:
         txt = n.get("text") or n.get("editor") or ""
         created = n.get("created") or ""
         status = " [Archived]" if n.get("archived") else ""
+        book_info = f"\nLinked Book: {n['book_title']}" if n.get("book_title") else ""
         att_info = ""
         if n.get("attachment_filenames"):
             att_info = f"\nAttachments: {', '.join(n['attachment_filenames'])}"
-        formatted.append(f"Title: {t}{status}\nContent: {txt}{att_info}\nDate: {created}")
+        formatted.append(f"Title: {t}{status}{book_info}\nContent: {txt}{att_info}\nDate: {created}")
     return "\n---\n".join(formatted)
 
 
@@ -269,6 +285,7 @@ async def handle_update_note(bot, args: dict, user_id: str, context: dict | None
     title = args.get("title")
     text = args.get("text")
     editor = args.get("editor")
+    book = args.get("book")
     archived = args.get("archived")
     if isinstance(archived, str):
         archived = archived.strip().lower() in ("true", "1", "yes")
@@ -283,5 +300,6 @@ async def handle_update_note(bot, args: dict, user_id: str, context: dict | None
         editor=editor if editor is not None else None,
         archived=archived if archived is not None else None,
         attachments=attachments or None,
+        book=str(book) if book is not None else None,
     )
 

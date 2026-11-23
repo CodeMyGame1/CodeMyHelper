@@ -23,7 +23,7 @@ class ReadingListSync(commands.Cog):
         self.google_books_api_key = os.getenv("GOOGLE_BOOKS_API_KEY")
         self.owner_id = int(os.getenv("OWNER_ID", "0"))
         
-        if self.pb_url and self.pb_user and self.pb_password and self.google_books_api_key and self.owner_id:
+        if self.pb_url and self.pb_user and self.pb_password and self.owner_id:
             self.sync_reading_list.start()
 
     def get_pb_client(self):
@@ -53,9 +53,20 @@ class ReadingListSync(commands.Cog):
             publish_date = getattr(record, "publish_date", getattr(record, "publishDate", ""))
             cover = getattr(record, "cover", "")
             description = getattr(record, "description", "")
+            has_total_pages = bool(getattr(record, "totalPages", 0))
+            has_image_url = bool(getattr(record, "imageUrl", "") and str(getattr(record, "imageUrl", "")).strip())
             
             # Check if any important metadata is missing
-            if not isbn or not publish_date or not cover or not title or not author or not description:
+            if (
+                not isbn
+                or not publish_date
+                or not cover
+                or not title
+                or not author
+                or not description
+                or not has_total_pages
+                or not has_image_url
+            ):
                 queries_to_try = []
                 clean_isbn = isbn.replace("-", "").replace(" ", "").strip() if isbn else ""
                 if clean_isbn and clean_isbn.isdigit() and len(clean_isbn) in (10, 13):
@@ -96,10 +107,18 @@ class ReadingListSync(commands.Cog):
                             update_data["author"] = ", ".join(book_data["authors"])
                         if not description and book_data.get("description") and book_data["description"] != "No description available.":
                             update_data["description"] = book_data["description"]
+                        if not has_total_pages and book_data.get("pageCount"):
+                            page_count = int(book_data["pageCount"])
+                            if page_count > 0:
+                                update_data["totalPages"] = page_count
+                                if getattr(record, "status", "") == "read" and not getattr(record, "currentPage", 0):
+                                    update_data["currentPage"] = page_count
                             
                         cover_data = None
                         cover_filename = None
                         thumbnail_url = book_data.get("thumbnail")
+                        if not has_image_url and thumbnail_url:
+                            update_data["imageUrl"] = thumbnail_url
                         
                         if not cover and thumbnail_url:
                             cover_filename, cover_data = await google_books.download_image(thumbnail_url)

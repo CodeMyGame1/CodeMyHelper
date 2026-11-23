@@ -11,7 +11,15 @@ from discord import app_commands
 from discord.ext import commands, tasks
 import sentry_sdk
 
-from utils.db import get_pb_client, get_pb_url, get_discord_user_id, run_in_executor
+from utils.db import (
+    get_pb_client,
+    get_pb_url,
+    get_discord_user_id,
+    get_user_book_titles_map,
+    resolve_user_book_id,
+    run_in_executor,
+    user_book_autocomplete_choices,
+)
 from utils.discord_helpers import UNLINKED_ACCOUNT_MESSAGE
 
 
@@ -511,6 +519,7 @@ class Reminders(commands.Cog):
         text: str,
         for_discord: bool = True,
         user_tz: str = None,
+        book: str | None = None,
     ) -> str:
         tz_map = {
             "jp": "Asia/Tokyo",
@@ -559,7 +568,7 @@ class Reminders(commands.Cog):
                 pb = get_pb_client()
                 pb_user_id = get_discord_user_id(pb, user_id)
                 if not pb_user_id:
-                    return f"Error: {UNLINKED_ACCOUNT_MESSAGE}", None
+                    return f"Error: {UNLINKED_ACCOUNT_MESSAGE}", None, ""
 
                 entry = {
                     "owner": str(pb_user_id),
@@ -567,10 +576,16 @@ class Reminders(commands.Cog):
                     "remind_at": dt_str,
                     "is_sent": False,
                 }
+                linked_book_title = ""
+                if book and str(book).strip():
+                    book_id, book_title = resolve_user_book_id(pb, pb_user_id, book)
+                    if book_id:
+                        entry["book"] = book_id
+                        linked_book_title = book_title
                 created_rec = pb.collection("reminders").create(entry)
-                return "success", created_rec
+                return "success", created_rec, linked_book_title
 
-            res, created_record = await run_in_executor(add_to_pocketbase)
+            res, created_record, linked_book_title = await run_in_executor(add_to_pocketbase)
             if res != "success":
                 return res
 
@@ -593,7 +608,8 @@ class Reminders(commands.Cog):
                 formatted_time = f"<t:{unix_timestamp}:F> (<t:{unix_timestamp}:R>)"
             else:
                 formatted_time = f"`{parsed_time.strftime('%Y-%m-%d %H:%M UTC')}`"
-            return f"Got it! I will remind you: **{text}** at {formatted_time}"
+            book_suffix = f" (📚 Linked to **{linked_book_title}**)" if linked_book_title else ""
+            return f"Got it! I will remind you: **{text}** at {formatted_time}{book_suffix}"
         except Exception as e:
             sentry_sdk.capture_exception(e)
             return f"An error occurred while saving the reminder: {e}"
@@ -684,6 +700,11 @@ class Reminders(commands.Cog):
                         "remind_at": dt_str,
                         "is_sent": False,
                     }
+                    item_book = item.get("book")
+                    if item_book and str(item_book).strip():
+                        book_id, _ = resolve_user_book_id(pb, pb_user_id, str(item_book))
+                        if book_id:
+                            entry["book"] = book_id
 
                     try:
                         rec = pb.collection("reminders").create(entry)
@@ -754,15 +775,21 @@ class Reminders(commands.Cog):
             return f"An error occurred while saving batch reminders: {e}"
 
     async def get_reminders_text(
-        self, user_id: str, for_discord: bool = True, status: str = "active", limit: int | None = None
+        self,
+        user_id: str,
+        for_discord: bool = True,
+        status: str = "active",
+        limit: int | None = None,
+        book: str | None = None,
     ) -> str:
         try:
             def get_from_pocketbase():
                 pb = get_pb_client()
                 pb_user_id = get_discord_user_id(pb, user_id)
                 if not pb_user_id:
-                    return None
+                    return None, {}
 
+                books_map = get_user_book_titles_map(pb, pb_user_id)
                 status_norm = (status or "active").strip().lower()
                 if status_norm == "sent":
                     filter_str = f"owner = '{pb_user_id}' && is_sent = true"
@@ -774,14 +801,20 @@ class Reminders(commands.Cog):
                     filter_str = f"owner = '{pb_user_id}' && (is_sent = false || is_sent = null)"
                     sort_str = "remind_at"
 
+                if book and str(book).strip():
+                    filter_book_id, _ = resolve_user_book_id(pb, pb_user_id, book)
+                    if not filter_book_id:
+                        return [], books_map
+                    filter_str += f" && book = '{filter_book_id}'"
+
                 records = pb.collection("reminders").get_full_list(
                     query_params={"filter": filter_str, "sort": sort_str}
                 )
                 if limit and limit > 0:
                     records = records[:limit]
-                return records
+                return records, books_map
 
-            records = await run_in_executor(get_from_pocketbase)
+            records, books_map = await run_in_executor(get_from_pocketbase)
 
             if records is None:
                 return f"Error: {UNLINKED_ACCOUNT_MESSAGE}"
@@ -803,9 +836,12 @@ class Reminders(commands.Cog):
 
             response = f"**{title_label}:**\n"
             for idx, record in enumerate(records, 1):
-                r_text = getattr(record, "reminder_text", "Unknown")
-                r_time = getattr(record, "remind_at", "Unknown time")
-                r_sent = getattr(record, "is_sent", False)
+                r_text = _get_field(record, "reminder_text", "Unknown")
+                r_time = _get_field(record, "remind_at", "Unknown time")
+                r_sent = _get_field(record, "is_sent", False)
+                r_book_id = _get_field(record, "book", "") or ""
+                book_title = books_map.get(r_book_id, "") if r_book_id else ""
+                book_tag = f" [📚 {book_title}]" if book_title else ""
                 sent_tag = " [Sent]" if r_sent else ""
 
                 try:
@@ -821,7 +857,7 @@ class Reminders(commands.Cog):
                 except Exception:
                     time_display = f"`{r_time}`"
 
-                response += f"{idx}. **{r_text}**{sent_tag} (at {time_display})\n"
+                response += f"{idx}. **{r_text}**{sent_tag}{book_tag} (at {time_display})\n"
 
             return response
         except Exception as e:
@@ -836,6 +872,7 @@ class Reminders(commands.Cog):
         text: str | None = None,
         user_tz: str | None = None,
         is_sent: bool | None = None,
+        book: str | None = None,
     ) -> str:
         try:
             clean_target = (reminder_id_or_query or "").strip()
@@ -932,6 +969,15 @@ class Reminders(commands.Cog):
                         update_data["is_sent"] = False
                 if is_sent is not None:
                     update_data["is_sent"] = is_sent
+                if book is not None:
+                    clean_book = str(book).strip()
+                    if clean_book.lower() in ("none", "clear", "unlink", "null", ""):
+                        update_data["book"] = ""
+                    else:
+                        book_id, _ = resolve_user_book_id(pb, pb_user_id, clean_book)
+                        if not book_id:
+                            return f"Error: Could not find a book matching '{clean_book}' on your reading list.", None
+                        update_data["book"] = book_id
 
                 if not update_data:
                     return "Error: No update fields provided.", None
@@ -978,11 +1024,23 @@ class Reminders(commands.Cog):
             sentry_sdk.capture_exception(e)
             return f"Failed to update reminder: {e}"
 
+    async def book_link_autocomplete(
+        self, interaction: discord.Interaction, current: str, include_unlink: bool = False
+    ) -> list[app_commands.Choice[str]]:
+        pairs = await run_in_executor(
+            user_book_autocomplete_choices,
+            str(interaction.user.id),
+            current,
+            include_unlink,
+        )
+        return [app_commands.Choice(name=label, value=val) for label, val in pairs]
+
     @app_commands.command(name="remind", description="Set a reminder.")
     @app_commands.describe(
         when="When to remind you (e.g. 'in 5 minutes', 'tomorrow at 3pm')",
         text="What to remind you about",
         timezone="Optional timezone (defaults to Eastern Time. e.g. 'jp', 'fr', 'Asia/Tokyo')",
+        book="Optional book from your reading list to link this reminder to",
     )
     async def set_reminder(
         self,
@@ -990,18 +1048,26 @@ class Reminders(commands.Cog):
         when: str,
         text: str,
         timezone: str = None,
+        book: str = None,
     ):
         await interaction.response.defer(ephemeral=True)
         response = await self.add_reminder(
-            str(interaction.user.id), when, text, user_tz=timezone
+            str(interaction.user.id), when, text, user_tz=timezone, book=book
         )
         await interaction.followup.send(response)
+
+    @set_reminder.autocomplete("book")
+    async def set_reminder_book_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        return await self.book_link_autocomplete(interaction, current)
 
     @app_commands.command(
         name="reminders", description="List your reminders (active, sent, or all)."
     )
     @app_commands.describe(
-        filter="Filter reminders by status (active, sent, or all)"
+        filter="Filter reminders by status (active, sent, or all)",
+        book="Optional book from your reading list to filter reminders by",
     )
     @app_commands.choices(filter=[
         app_commands.Choice(name="Active (Upcoming)", value="active"),
@@ -1009,12 +1075,18 @@ class Reminders(commands.Cog):
         app_commands.Choice(name="All Reminders", value="all"),
     ])
     async def list_reminders(
-        self, interaction: discord.Interaction, filter: app_commands.Choice[str] = None
+        self, interaction: discord.Interaction, filter: app_commands.Choice[str] = None, book: str = None
     ):
         await interaction.response.defer(ephemeral=True)
         status_val = filter.value if filter else "active"
-        response = await self.get_reminders_text(str(interaction.user.id), for_discord=True, status=status_val)
+        response = await self.get_reminders_text(str(interaction.user.id), for_discord=True, status=status_val, book=book)
         await interaction.followup.send(response)
+
+    @list_reminders.autocomplete("book")
+    async def list_reminders_book_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        return await self.book_link_autocomplete(interaction, current)
 
     @app_commands.command(
         name="editreminder", description="Edit or reschedule an existing reminder."
@@ -1024,6 +1096,7 @@ class Reminders(commands.Cog):
         when="New time to remind you (e.g. 'in 10 minutes', 'tomorrow at 4pm')",
         text="New reminder message",
         timezone="Optional timezone (defaults to Eastern Time. e.g. 'jp', 'fr', 'Asia/Tokyo')",
+        book="Optional book to link this reminder to (choose None / Unlink to clear)",
     )
     async def slash_edit_reminder(
         self,
@@ -1032,6 +1105,7 @@ class Reminders(commands.Cog):
         when: str = None,
         text: str = None,
         timezone: str = None,
+        book: str = None,
     ):
         await interaction.response.defer(ephemeral=True)
         response = await self.update_reminder(
@@ -1040,6 +1114,7 @@ class Reminders(commands.Cog):
             when=when,
             text=text,
             user_tz=timezone,
+            book=book,
         )
         await interaction.followup.send(response)
 
@@ -1048,6 +1123,12 @@ class Reminders(commands.Cog):
         self, interaction: discord.Interaction, current: str
     ) -> list[app_commands.Choice[str]]:
         return await self.reminder_autocomplete(interaction, current)
+
+    @slash_edit_reminder.autocomplete("book")
+    async def slash_edit_reminder_book_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        return await self.book_link_autocomplete(interaction, current, include_unlink=True)
 
     async def delete_reminder(
         self, user_id: str, reminder_id_or_query: str

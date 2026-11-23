@@ -74,9 +74,84 @@ def _extract_isbn(identifiers: list) -> str:
             return identifier.get("identifier", "")
     return ""
 
-async def fetch_book_data(query: str, api_key: str):
+async def fetch_open_library_data(query: str) -> dict | None:
     """
-    Fetches detailed book data from Google Books API.
+    Fetches book metadata from Open Library Search API as a zero-config fallback.
+    Returns a dictionary shaped identically to Google Books volume data, or None.
+    """
+    if not query or not query.strip():
+        return None
+
+    url = "https://openlibrary.org/search.json"
+    params = {
+        "q": query.strip(),
+        "limit": 1,
+        "fields": "title,author_name,first_publish_year,isbn,cover_i,number_of_pages_median,first_sentence,subject",
+    }
+    try:
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url, params=params) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+                docs = data.get("docs") or []
+                if not docs:
+                    return None
+
+                doc = docs[0]
+                title = doc.get("title") or "Unknown Title"
+                authors = doc.get("author_name") or ["Unknown Author"]
+                publish_year = doc.get("first_publish_year")
+                published_date = str(publish_year) if publish_year else "Unknown"
+                page_count = int(doc.get("number_of_pages_median") or 0)
+
+                isbns = doc.get("isbn") or []
+                chosen_isbn = ""
+                for candidate in isbns:
+                    c = str(candidate).replace("-", "").strip()
+                    if len(c) == 13:
+                        chosen_isbn = c
+                        break
+                if not chosen_isbn and isbns:
+                    chosen_isbn = str(isbns[0]).replace("-", "").strip()
+
+                cover_i = doc.get("cover_i")
+                thumbnail = (
+                    f"https://covers.openlibrary.org/b/id/{cover_i}-L.jpg"
+                    if cover_i
+                    else ""
+                )
+
+                first_sentence = doc.get("first_sentence")
+                if isinstance(first_sentence, list) and first_sentence:
+                    description = str(first_sentence[0])
+                elif isinstance(first_sentence, str) and first_sentence.strip():
+                    description = first_sentence.strip()
+                elif doc.get("subject"):
+                    description = "Subjects: " + ", ".join(str(s) for s in doc["subject"][:5])
+                else:
+                    description = "No description available."
+
+                return {
+                    "title": title,
+                    "authors": authors,
+                    "description": description,
+                    "pageCount": page_count,
+                    "averageRating": "N/A",
+                    "thumbnail": thumbnail,
+                    "publishedDate": published_date,
+                    "isbn": chosen_isbn,
+                }
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        return None
+
+
+async def fetch_book_data(query: str, api_key: str | None = None):
+    """
+    Fetches detailed book data from Google Books API, falling back to Open Library
+    when the Google Books API key is not set or returns no match.
     Returns a dictionary of book details or an error string.
     """
     if not query:
@@ -94,10 +169,6 @@ async def fetch_book_data(query: str, api_key: str):
                 cached["thumbnail"] = clean_thumbnail_url(cached["thumbnail"])
             return cached
 
-    # 2. If not in cache, fetch from Google Books API
-    if not api_key:
-        return "Google Books API key is not configured."
-
     raw_query = query.strip()
     isbn_clean = raw_query.lower()
     if isbn_clean.startswith("isbn:"):
@@ -109,52 +180,58 @@ async def fetch_book_data(query: str, api_key: str):
     else:
         api_query = raw_query
 
-    url = "https://www.googleapis.com/books/v1/volumes"
-    params = {"q": api_query, "key": api_key}
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if data.get("items"):
-                        vol_info = data["items"][0].get("volumeInfo", {})
-                        
-                        image_links = vol_info.get("imageLinks", {})
-                        raw_thumbnail = (
-                            image_links.get("extraLarge")
-                            or image_links.get("large")
-                            or image_links.get("medium")
-                            or image_links.get("small")
-                            or image_links.get("thumbnail")
-                            or image_links.get("smallThumbnail")
-                            or ""
-                        )
-                        thumbnail = clean_thumbnail_url(raw_thumbnail)
+    # 2. Try Google Books API if API key is configured
+    if api_key:
+        url = "https://www.googleapis.com/books/v1/volumes"
+        params = {"q": api_query, "key": api_key}
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, params=params) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if data.get("items"):
+                            vol_info = data["items"][0].get("volumeInfo", {})
 
-                        book_data = {
-                            "title": vol_info.get("title", "Unknown Title"),
-                            "authors": vol_info.get("authors", ["Unknown Author"]),
-                            "description": vol_info.get("description", "No description available."),
-                            "pageCount": vol_info.get("pageCount", 0),
-                            "averageRating": vol_info.get("averageRating", "N/A"),
-                            "thumbnail": thumbnail,
-                            "publishedDate": vol_info.get("publishedDate", "Unknown"),
-                            "isbn": _extract_isbn(vol_info.get("industryIdentifiers", []))
-                        }
+                            image_links = vol_info.get("imageLinks", {})
+                            raw_thumbnail = (
+                                image_links.get("extraLarge")
+                                or image_links.get("large")
+                                or image_links.get("medium")
+                                or image_links.get("small")
+                                or image_links.get("thumbnail")
+                                or image_links.get("smallThumbnail")
+                                or ""
+                            )
+                            thumbnail = clean_thumbnail_url(raw_thumbnail)
 
-                        # 3. Store inside local JSON cache if meaningful data was found
-                        if book_data.get("publishedDate") != "Unknown":
-                            cache[query_key] = book_data
-                            await asyncio.to_thread(_save_cache)
+                            book_data = {
+                                "title": vol_info.get("title", "Unknown Title"),
+                                "authors": vol_info.get("authors", ["Unknown Author"]),
+                                "description": vol_info.get("description", "No description available."),
+                                "pageCount": vol_info.get("pageCount", 0),
+                                "averageRating": vol_info.get("averageRating", "N/A"),
+                                "thumbnail": thumbnail,
+                                "publishedDate": vol_info.get("publishedDate", "Unknown"),
+                                "isbn": _extract_isbn(vol_info.get("industryIdentifiers", []))
+                            }
 
-                        return book_data
-                    else:
-                        return f"No books found for query: `{query}`."
-                else:
-                    return "Failed to fetch data from Google Books API."
-    except Exception as e:
-        sentry_sdk.capture_exception(e)
-        return "An internal error occurred while fetching book data."
+                            if book_data.get("publishedDate") != "Unknown":
+                                cache[query_key] = book_data
+                                await asyncio.to_thread(_save_cache)
+
+                            return book_data
+        except Exception as e:
+            sentry_sdk.capture_exception(e)
+
+    # 3. Fall back to Open Library Search API (zero-config)
+    ol_data = await fetch_open_library_data(isbn_clean if (isbn_clean.isdigit() and len(isbn_clean) in (10, 13)) else raw_query)
+    if ol_data:
+        if ol_data.get("publishedDate") != "Unknown":
+            cache[query_key] = ol_data
+            await asyncio.to_thread(_save_cache)
+        return ol_data
+
+    return f"No books found for query: `{query}`."
 
 async def search_books(query: str, api_key: str, order_by: str = None) -> list:
     """

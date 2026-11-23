@@ -23,6 +23,10 @@ SET_REMINDER_TOOL = types.FunctionDeclaration(
                 type=types.Type.STRING,
                 description="Optional timezone or abbreviation (e.g. 'US/Eastern', 'jp', 'fr', 'ca', 'US/Central', 'US/Pacific')",
             ),
+            "book": types.Schema(
+                type=types.Type.STRING,
+                description="Optional title, ISBN, or ID of a book on the user's reading list to link this reminder to",
+            ),
         },
         required=["when", "text"],
     ),
@@ -41,6 +45,10 @@ LIST_REMINDERS_TOOL = types.FunctionDeclaration(
             "limit": types.Schema(
                 type=types.Type.INTEGER,
                 description="Maximum number of reminders to return (optional)",
+            ),
+            "book": types.Schema(
+                type=types.Type.STRING,
+                description="Optional book title, ISBN, or ID to filter reminders linked to a specific book",
             ),
         },
     ),
@@ -87,6 +95,10 @@ UPDATE_REMINDER_TOOL = types.FunctionDeclaration(
                 type=types.Type.BOOLEAN,
                 description="Optional flag to mark reminder as sent or active",
             ),
+            "book": types.Schema(
+                type=types.Type.STRING,
+                description="Optional book title, ISBN, or ID to link this reminder to (pass 'none' to unlink)",
+            ),
         },
         required=["query"],
     ),
@@ -112,6 +124,10 @@ BATCH_SET_REMINDERS_TOOL = types.FunctionDeclaration(
                             type=types.Type.STRING,
                             description="The reminder content or reading target (e.g. '📖 Read Dune: pp. 1–25').",
                         ),
+                        "book": types.Schema(
+                            type=types.Type.STRING,
+                            description="Optional book title, ISBN, or ID to link this reminder to.",
+                        ),
                     },
                     required=["when", "text"],
                 ),
@@ -135,10 +151,11 @@ async def handle_set_reminder(bot, args: dict, user_id: str) -> str:
     when = str(args.get("when") or args.get("time") or args.get("remind_at") or "").strip()
     text = str(args.get("text") or args.get("reminder_text") or args.get("message") or "").strip()
     tz = str(args.get("timezone") or args.get("tz") or "").strip()
+    book = str(args.get("book") or "").strip() or None
     if not when or not text:
         return "Error: 'when' and 'text' are required for a reminder."
     res = await reminders_cog.add_reminder(
-        user_id, when, text, for_discord=True, user_tz=tz or None
+        user_id, when, text, for_discord=True, user_tz=tz or None, book=book
     )
     return res
 
@@ -155,7 +172,8 @@ async def handle_list_reminders(bot, args: dict, user_id: str) -> str:
         limit = int(limit)
     elif not isinstance(limit, int):
         limit = None
-    res = await reminders_cog.get_reminders_text(user_id, for_discord=False, status=status, limit=limit)
+    book = str(args.get("book") or "").strip() or None
+    res = await reminders_cog.get_reminders_text(user_id, for_discord=False, status=status, limit=limit, book=book)
     return res or "No reminders found."
 
 
@@ -185,6 +203,8 @@ async def handle_update_reminder(bot, args: dict, user_id: str) -> str:
     text_str = str(text).strip() if text is not None else None
     tz = args.get("timezone") or args.get("tz")
     tz_str = str(tz).strip() if tz is not None else None
+    book = args.get("book")
+    book_str = str(book).strip() if book is not None else None
     raw_is_sent = args.get("is_sent")
     if isinstance(raw_is_sent, str):
         is_sent = raw_is_sent.strip().lower() in ("true", "1", "yes")
@@ -200,6 +220,7 @@ async def handle_update_reminder(bot, args: dict, user_id: str) -> str:
         text=text_str,
         user_tz=tz_str,
         is_sent=is_sent,
+        book=book_str,
     )
 
 
