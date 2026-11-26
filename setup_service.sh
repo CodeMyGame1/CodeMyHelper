@@ -13,16 +13,16 @@ uv sync
 
 # 2. Copy the service file
 echo "📄 Copying shisho.service to /etc/systemd/system/..."
-cp shisho.service /etc/systemd/system/
+sudo cp shisho.service /etc/systemd/system/
 
 # 3. Reload systemd
 echo "🔄 Reloading systemd daemon..."
-systemctl daemon-reload
+sudo systemctl daemon-reload
 
 # 4. Enable and Start the service
 echo "🏗️ Enabling and starting shisho.service..."
-systemctl enable shisho.service
-systemctl start shisho.service
+sudo systemctl enable shisho.service
+sudo systemctl start shisho.service
 
 echo "✅ Setup complete! Checking service status..."
-systemctl status shisho.service --no-pager
+sudo systemctl status shisho.service --no-pager
